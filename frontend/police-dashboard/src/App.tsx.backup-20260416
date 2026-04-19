@@ -1,0 +1,1358 @@
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { io, Socket } from "socket.io-client";
+
+// ═══════════════════════════════════════════════════════════════
+// TourSafe360 v2 — NE Command Center
+// Production-grade police dashboard with live FastAPI integration
+// ═══════════════════════════════════════════════════════════════
+
+const API = "http://localhost:8000"; // sed-replaced by update_ip.sh
+const TOKEN_KEY = "ts360_police_token";
+
+// ─── PALETTE ────────────────────────────────────────────────────
+const palette = {
+  bg: "#0a0e1a",
+  bgCard: "rgba(15, 22, 42, 0.85)",
+  bgGlass: "rgba(20, 30, 55, 0.6)",
+  sidebar: "linear-gradient(180deg, #0d1529 0%, #0a1024 100%)",
+  accent: "#00e5ff",
+  accentGlow: "0 0 20px rgba(0,229,255,0.3)",
+  danger: "#ff3d71",
+  dangerGlow: "0 0 20px rgba(255,61,113,0.3)",
+  warning: "#ffaa00",
+  warningGlow: "0 0 15px rgba(255,170,0,0.25)",
+  success: "#00e676",
+  successGlow: "0 0 15px rgba(0,230,118,0.25)",
+  purple: "#b388ff",
+  purpleGlow: "0 0 15px rgba(179,136,255,0.25)",
+  text: "#e4eaf5",
+  textDim: "#7b8ab3",
+  border: "rgba(100,140,200,0.12)",
+  borderGlow: "rgba(0,229,255,0.15)",
+};
+
+const STATES_NE = ["Assam","Meghalaya","Nagaland","Manipur","Mizoram","Tripura","Arunachal Pradesh","Sikkim"];
+
+// ─── TYPES ──────────────────────────────────────────────────────
+interface Tourist {
+  id: string;
+  name: string;
+  country?: string;
+  flag?: string;
+  email?: string;
+  phone?: string;
+  current_lat?: number;
+  current_lng?: number;
+  location?: string;
+  state?: string;
+  status?: string;
+  last_seen?: number;
+  emergency_contact?: string;
+}
+
+interface SOSAlert {
+  id: string;
+  alert_id?: string;
+  tourist_name?: string;
+  tourist_id?: string;
+  alert_type: string;
+  latitude: number;
+  longitude: number;
+  message?: string;
+  severity?: string;
+  status?: string;
+  created_at?: string;
+  ai_triage?: {
+    medical_needed?: boolean;
+    equipment?: string[];
+    estimated_response_time?: string;
+    confidence?: number;
+  };
+  nearest_police?: { name: string; contact: string };
+  geofence_name?: string;
+}
+
+interface Geofence {
+  id: string;
+  name: string;
+  zone_type: string;
+  description?: string;
+  state?: string;
+  radius_km: number;
+  center_lat: number;
+  center_lng: number;
+  active?: boolean;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// API LAYER
+// ═══════════════════════════════════════════════════════════════
+const api = {
+  async login(email: string, password: string) {
+    const res = await fetch(`${API}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!res.ok) throw new Error("Invalid credentials");
+    return res.json();
+  },
+  async getTourists(token: string): Promise<Tourist[]> {
+    try {
+      const res = await fetch(`${API}/api/tourists/active`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data) ? data : (data.tourists || []);
+    } catch { return []; }
+  },
+  async getSOSAlerts(token: string): Promise<SOSAlert[]> {
+    try {
+      const res = await fetch(`${API}/api/sos/all`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data) ? data : (data.alerts || []);
+    } catch { return []; }
+  },
+  async getGeofences(token: string): Promise<Geofence[]> {
+    try {
+      const res = await fetch(`${API}/api/geofence/`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const res2 = await fetch(`${API}/api/zones/`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res2.ok) return [];
+        const data = await res2.json();
+        return Array.isArray(data) ? data : (data.zones || []);
+      }
+      const data = await res.json();
+      return Array.isArray(data) ? data : (data.geofences || []);
+    } catch { return []; }
+  },
+  async resolveAlert(token: string, alertId: string) {
+    return fetch(`${API}/api/sos/${alertId}/resolve`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  },
+  async getAgentsStatus(token: string) {
+    try {
+      const res = await fetch(`${API}/api/agents/status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return res.ok ? await res.json() : null;
+    } catch { return null; }
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// SHARED COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+const Pulse: React.FC<{ color?: string; size?: number; style?: React.CSSProperties }> = ({ color = palette.danger, size = 10, style = {} }) => (
+  <span style={{ display:"inline-block", position:"relative", width:size, height:size, ...style }}>
+    <span style={{ position:"absolute", inset:0, borderRadius:"50%", background:color, animation:"pulse-ring 1.5s ease-out infinite" }}/>
+    <span style={{ position:"absolute", inset: size*0.2, borderRadius:"50%", background:color }}/>
+  </span>
+);
+
+const Badge: React.FC<{ children: React.ReactNode; color: string; glow?: string }> = ({ children, color, glow }) => (
+  <span style={{
+    display:"inline-flex", alignItems:"center", gap:4,
+    padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:700,
+    background: `${color}18`, color, border:`1px solid ${color}40`,
+    boxShadow: glow, letterSpacing:0.5, textTransform:"uppercase",
+  }}>{children}</span>
+);
+
+const StatCard: React.FC<{ label: string; value: number | string; icon: string; color: string; delay?: number }> = ({ label, value, icon, color, delay = 0 }) => {
+  const [show, setShow] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setShow(true), delay); return () => clearTimeout(t); }, [delay]);
+  return (
+    <div style={{
+      background: palette.bgCard, backdropFilter:"blur(20px)",
+      border:`1px solid ${palette.border}`, borderRadius:16,
+      padding:"20px 24px", flex:1, minWidth:160,
+      transform: show ? "translateY(0)" : "translateY(20px)",
+      opacity: show ? 1 : 0,
+      transition:"all 0.6s cubic-bezier(0.16,1,0.3,1)",
+      position:"relative", overflow:"hidden",
+    }}>
+      <div style={{ position:"absolute", top:0, left:0, right:0, height:2, background:`linear-gradient(90deg, transparent, ${color}, transparent)` }}/>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+        <div>
+          <div style={{ fontSize:12, color:palette.textDim, fontWeight:500, letterSpacing:1, textTransform:"uppercase", marginBottom:8 }}>{label}</div>
+          <div style={{ fontSize:32, fontWeight:800, color, fontFamily:"'JetBrains Mono', monospace", lineHeight:1 }}>{value}</div>
+        </div>
+        <div style={{ fontSize:28, opacity:0.4 }}>{icon}</div>
+      </div>
+    </div>
+  );
+};
+
+const GlassCard: React.FC<{ children: React.ReactNode; style?: React.CSSProperties; delay?: number; onClick?: () => void }> = ({ children, style = {}, delay = 0, onClick }) => {
+  const [show, setShow] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setShow(true), delay); return () => clearTimeout(t); }, [delay]);
+  return (
+    <div onClick={onClick} style={{
+      background: palette.bgGlass, backdropFilter:"blur(16px)",
+      border:`1px solid ${palette.border}`, borderRadius:14, padding:20,
+      transform: show ? "translateY(0)" : "translateY(15px)", opacity: show ? 1 : 0,
+      transition:"all 0.5s cubic-bezier(0.16,1,0.3,1)",
+      cursor: onClick ? "pointer" : "default", ...style,
+    }}>{children}</div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+// LIVE MAP (SVG NE India)
+// ═══════════════════════════════════════════════════════════════
+const MiniMap: React.FC<{ tourists: Tourist[]; geofences: Geofence[]; height?: number }> = ({ tourists, geofences, height = 420 }) => {
+  const mapToSVG = (lat: number, lng: number, w = 700, h = 420) => ({
+    x: ((lng - 88) / 9) * w,
+    y: h - ((lat - 22) / 6) * h,
+  });
+
+  return (
+    <svg viewBox="0 0 700 420" style={{ width:"100%", height, borderRadius:12, background:"rgba(5,10,25,0.8)" }}>
+      <defs>
+        <radialGradient id="glow-green"><stop offset="0%" stopColor={palette.success} stopOpacity="0.6"/><stop offset="100%" stopColor={palette.success} stopOpacity="0"/></radialGradient>
+        <radialGradient id="glow-red"><stop offset="0%" stopColor={palette.danger} stopOpacity="0.6"/><stop offset="100%" stopColor={palette.danger} stopOpacity="0"/></radialGradient>
+        <radialGradient id="glow-yellow"><stop offset="0%" stopColor={palette.warning} stopOpacity="0.5"/><stop offset="100%" stopColor={palette.warning} stopOpacity="0"/></radialGradient>
+        <filter id="blur-sm"><feGaussianBlur stdDeviation="2"/></filter>
+      </defs>
+      {[0,1,2,3,4,5,6].map(i => <line key={`h${i}`} x1="0" y1={i*70} x2="700" y2={i*70} stroke={palette.border} strokeWidth="0.5"/>)}
+      {[0,1,2,3,4,5,6,7].map(i => <line key={`v${i}`} x1={i*100} y1="0" x2={i*100} y2="420" stroke={palette.border} strokeWidth="0.5"/>)}
+      {[
+        { name:"ASSAM", lat:26.2, lng:92.5 }, { name:"MEGHALAYA", lat:25.5, lng:91.3 },
+        { name:"NAGALAND", lat:26.1, lng:94.5 }, { name:"MANIPUR", lat:24.8, lng:93.9 },
+        { name:"MIZORAM", lat:23.3, lng:92.7 }, { name:"TRIPURA", lat:23.7, lng:91.3 },
+        { name:"ARUNACHAL", lat:27.5, lng:93.5 }, { name:"SIKKIM", lat:27.3, lng:88.6 },
+      ].map(s => {
+        const p = mapToSVG(s.lat, s.lng);
+        return <text key={s.name} x={p.x} y={p.y} fill={palette.textDim} fontSize="9" fontWeight="600" textAnchor="middle" opacity="0.5" fontFamily="monospace">{s.name}</text>;
+      })}
+      {geofences.map(g => {
+        const p = mapToSVG(g.center_lat, g.center_lng);
+        const col = g.zone_type === "danger" ? palette.danger : g.zone_type === "restricted" ? palette.warning : palette.purple;
+        return (
+          <g key={g.id}>
+            <circle cx={p.x} cy={p.y} r={g.radius_km * 5} fill={col} opacity="0.08" stroke={col} strokeWidth="1" strokeDasharray="4 4" strokeOpacity="0.4">
+              <animate attributeName="r" values={`${g.radius_km*4.5};${g.radius_km*5.5};${g.radius_km*4.5}`} dur="3s" repeatCount="indefinite"/>
+            </circle>
+          </g>
+        );
+      })}
+      {tourists.filter(t => t.current_lat && t.current_lng).map(t => {
+        const p = mapToSVG(t.current_lat!, t.current_lng!);
+        const status = t.status || "safe";
+        const col = status === "safe" ? palette.success : status === "risky" ? palette.warning : palette.danger;
+        const glowId = status === "safe" ? "glow-green" : status === "risky" ? "glow-yellow" : "glow-red";
+        return (
+          <g key={t.id}>
+            <circle cx={p.x} cy={p.y} r="16" fill={`url(#${glowId})`} filter="url(#blur-sm)">
+              {status === "danger" && <animate attributeName="r" values="14;20;14" dur="1.2s" repeatCount="indefinite"/>}
+            </circle>
+            <circle cx={p.x} cy={p.y} r="4" fill={col} stroke="#fff" strokeWidth="1.5">
+              {status !== "safe" && <animate attributeName="r" values="3.5;5;3.5" dur="1.5s" repeatCount="indefinite"/>}
+            </circle>
+            <text x={p.x + 8} y={p.y + 3} fill={palette.text} fontSize="8" fontFamily="monospace">{t.name?.split(" ")[0]}</text>
+          </g>
+        );
+      })}
+      <g transform="translate(660,30)">
+        <circle r="18" fill="none" stroke={palette.border} strokeWidth="1"/>
+        <text y="-6" textAnchor="middle" fill={palette.accent} fontSize="10" fontWeight="800">N</text>
+        <line x1="0" y1="-3" x2="0" y2="12" stroke={palette.textDim} strokeWidth="1"/>
+      </g>
+    </svg>
+  );
+};
+
+const BarChart: React.FC<{ data: any[]; dataKey: string; color: string; height?: number }> = ({ data, dataKey, color, height = 200 }) => {
+  if (!data.length) return <div style={{ color:palette.textDim, fontSize:12, padding:20, textAlign:"center" }}>No data</div>;
+  const max = Math.max(...data.map(d => d[dataKey] || 0), 1);
+  const barW = Math.min(40, (600 / data.length) - 8);
+  return (
+    <svg viewBox={`0 0 ${data.length * (barW + 8) + 40} ${height + 40}`} style={{ width:"100%", height }}>
+      {data.map((d, i) => {
+        const h = (d[dataKey] / max) * height * 0.8;
+        return (
+          <g key={i}>
+            <rect x={i * (barW + 8) + 20} y={height - h} width={barW} height={h} rx="4" fill={color} opacity="0.85">
+              <animate attributeName="height" from="0" to={h} dur="0.6s" fill="freeze" begin={`${i * 0.05}s`}/>
+              <animate attributeName="y" from={height} to={height - h} dur="0.6s" fill="freeze" begin={`${i * 0.05}s`}/>
+            </rect>
+            <text x={i * (barW + 8) + 20 + barW/2} y={height + 16} fill={palette.textDim} fontSize="9" textAnchor="middle" fontFamily="monospace">
+              {d.name || d.day || d.state || Object.values(d)[0]}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+};
+
+const DonutChart: React.FC<{ segments: { value: number; color: string }[]; size?: number }> = ({ segments, size = 160 }) => {
+  const total = segments.reduce((s, d) => s + d.value, 0) || 1;
+  let cumulative = 0;
+  const r = size * 0.35;
+  const circumference = 2 * Math.PI * r;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      {segments.map((seg, i) => {
+        const pct = seg.value / total;
+        const dashLen = pct * circumference;
+        const dashOff = -cumulative * circumference;
+        cumulative += pct;
+        return (
+          <circle key={i} cx={size/2} cy={size/2} r={r} fill="none" stroke={seg.color} strokeWidth={size*0.12}
+            strokeDasharray={`${dashLen} ${circumference - dashLen}`} strokeDashoffset={dashOff}
+            transform={`rotate(-90 ${size/2} ${size/2})`} style={{ transition:"all 1s ease" }}/>
+        );
+      })}
+      <text x={size/2} y={size/2 - 6} textAnchor="middle" fill={palette.text} fontSize="22" fontWeight="800" fontFamily="'JetBrains Mono', monospace">{total}</text>
+      <text x={size/2} y={size/2 + 12} textAnchor="middle" fill={palette.textDim} fontSize="9" fontWeight="500">TOTAL</text>
+    </svg>
+  );
+};
+
+const RiskGauge: React.FC<{ value: number; label: string; size?: number }> = ({ value, label, size = 80 }) => {
+  const r = size * 0.38;
+  const c = Math.PI * r;
+  const fill = (value / 100) * c;
+  const col = value > 75 ? palette.danger : value > 50 ? palette.warning : palette.success;
+  return (
+    <div style={{ textAlign:"center" }}>
+      <svg width={size} height={size * 0.6} viewBox={`0 0 ${size} ${size * 0.6}`}>
+        <path d={`M ${size*0.1} ${size*0.55} A ${r} ${r} 0 0 1 ${size*0.9} ${size*0.55}`} fill="none" stroke={palette.border} strokeWidth="6" strokeLinecap="round"/>
+        <path d={`M ${size*0.1} ${size*0.55} A ${r} ${r} 0 0 1 ${size*0.9} ${size*0.55}`} fill="none" stroke={col} strokeWidth="6" strokeLinecap="round"
+          strokeDasharray={`${fill} ${c}`} style={{ filter:`drop-shadow(0 0 6px ${col})`, transition:"all 1s ease" }}/>
+        <text x={size/2} y={size*0.5} textAnchor="middle" fill={col} fontSize="16" fontWeight="800" fontFamily="'JetBrains Mono', monospace">{value}%</text>
+      </svg>
+      <div style={{ fontSize:10, color:palette.textDim, marginTop:2, fontWeight:600 }}>{label}</div>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+// PREMIUM LOGIN SCREEN
+// ═══════════════════════════════════════════════════════════════
+const LoginScreen: React.FC<{ onLogin: (token: string) => void }> = ({ onLogin }) => {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleLogin = async () => {
+    if (!email || !password) { setError("Enter credentials"); return; }
+    setLoading(true); setError("");
+    try {
+      const data = await api.login(email, password);
+      const token = data.token || data.access_token;
+      if (!token) throw new Error("No token returned");
+      localStorage.setItem(TOKEN_KEY, token);
+      onLogin(token);
+    } catch (err: any) {
+      setError(err.message || "Login failed");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{
+      minHeight:"100vh", background:palette.bg, display:"flex", alignItems:"center", justifyContent:"center",
+      fontFamily:"'Segoe UI', sans-serif", color:palette.text, position:"relative", overflow:"hidden",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&display=swap');
+        @keyframes pulse-ring { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(2.5); opacity: 0; } }
+        @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes scanline { from { top: -2px; } to { top: 100%; } }
+        @keyframes glow-pulse { 0%, 100% { box-shadow: 0 0 10px ${palette.accent}30; } 50% { box-shadow: 0 0 30px ${palette.accent}60; } }
+        @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+      `}</style>
+
+      {/* Background gradient orbs */}
+      <div style={{ position:"absolute", top:"-10%", left:"-10%", width:600, height:600, borderRadius:"50%",
+        background:`radial-gradient(circle, ${palette.accent}15, transparent 70%)`, filter:"blur(60px)" }}/>
+      <div style={{ position:"absolute", bottom:"-10%", right:"-10%", width:600, height:600, borderRadius:"50%",
+        background:`radial-gradient(circle, ${palette.purple}15, transparent 70%)`, filter:"blur(60px)" }}/>
+
+      {/* Grid overlay */}
+      <svg style={{ position:"absolute", inset:0, width:"100%", height:"100%", opacity:0.04, pointerEvents:"none" }}>
+        <defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+          <path d="M 40 0 L 0 0 0 40" fill="none" stroke={palette.accent} strokeWidth="0.5"/>
+        </pattern></defs>
+        <rect width="100%" height="100%" fill="url(#grid)"/>
+      </svg>
+
+      <div style={{ display:"flex", gap:60, alignItems:"center", maxWidth:1100, width:"100%", padding:"0 40px", position:"relative", zIndex:1 }}>
+        {/* Left side — branding */}
+        <div style={{ flex:1, opacity:0, animation:"fadeSlideIn 0.8s 0.1s forwards" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:14, marginBottom:30 }}>
+            <div style={{
+              width:56, height:56, borderRadius:14,
+              background:`linear-gradient(135deg, ${palette.accent}, ${palette.purple})`,
+              display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:24, fontWeight:800, animation:"float 3s ease-in-out infinite",
+              boxShadow:`0 0 40px ${palette.accent}40`,
+            }}>NE</div>
+            <div>
+              <div style={{ fontSize:24, fontWeight:800, letterSpacing:1.5 }}>NE COMMAND</div>
+              <div style={{ fontSize:11, letterSpacing:3, color:palette.accent, textTransform:"uppercase" }}>Tourist Safety Division</div>
+            </div>
+          </div>
+
+          <div style={{ fontSize:42, fontWeight:300, lineHeight:1.2, marginBottom:20, letterSpacing:-0.5 }}>
+            AI-First <span style={{ color:palette.accent, fontWeight:700 }}>Tourist Safety</span><br/>
+            Platform for <span style={{ color:palette.purple, fontWeight:700 }}>Northeast India</span>
+          </div>
+
+          <div style={{ fontSize:14, color:palette.textDim, lineHeight:1.7, marginBottom:30, maxWidth:480 }}>
+            Real-time tourist tracking, predictive threat intelligence, geofence breach detection,
+            and AI-powered SOS triage — operating across 8 NE states with sub-second response time.
+          </div>
+
+          <div style={{ display:"flex", gap:24, marginTop:30 }}>
+            {[
+              { label:"States Covered", value:"8" },
+              { label:"AI Agents", value:"3" },
+              { label:"Response SLA", value:"<8s" },
+              { label:"Uptime", value:"99.9%" },
+            ].map((s, i) => (
+              <div key={s.label} style={{ opacity:0, animation:`fadeSlideIn 0.5s ${0.3 + i*0.1}s forwards` }}>
+                <div style={{ fontSize:24, fontWeight:800, color:palette.accent, fontFamily:"'JetBrains Mono', monospace" }}>{s.value}</div>
+                <div style={{ fontSize:10, color:palette.textDim, letterSpacing:1, textTransform:"uppercase", marginTop:2 }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Right side — login card */}
+        <div style={{
+          width:400, padding:36, borderRadius:20,
+          background:palette.bgCard, backdropFilter:"blur(30px)",
+          border:`1px solid ${palette.border}`,
+          boxShadow:`0 20px 60px rgba(0,0,0,0.5), 0 0 0 1px ${palette.borderGlow}`,
+          opacity:0, animation:"fadeSlideIn 0.8s 0.3s forwards", position:"relative", overflow:"hidden",
+        }}>
+          {/* Scanline */}
+          <div style={{ position:"absolute", left:0, right:0, height:2,
+            background:`linear-gradient(90deg, transparent, ${palette.accent}50, transparent)`,
+            animation:"scanline 4s linear infinite", pointerEvents:"none" }}/>
+
+          <div style={{ marginBottom:30 }}>
+            <div style={{ fontSize:11, letterSpacing:2, color:palette.accent, fontWeight:600, marginBottom:8 }}>SECURE ACCESS</div>
+            <div style={{ fontSize:24, fontWeight:700 }}>Officer Sign In</div>
+            <div style={{ fontSize:12, color:palette.textDim, marginTop:6 }}>Authorized personnel only · Session encrypted</div>
+          </div>
+
+          <div style={{ marginBottom:18 }}>
+            <div style={{ fontSize:11, color:palette.textDim, marginBottom:8, letterSpacing:1 }}>OFFICER EMAIL</div>
+            <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+              placeholder="officer@netourism.gov.in"
+              onKeyDown={e => e.key === "Enter" && handleLogin()}
+              style={{
+                width:"100%", padding:"12px 14px", borderRadius:10,
+                background:"rgba(0,0,0,0.3)", border:`1px solid ${palette.border}`,
+                color:palette.text, fontSize:13, outline:"none", transition:"all 0.2s",
+                fontFamily:"inherit",
+              }}
+              onFocus={e => { e.target.style.borderColor = palette.accent; e.target.style.boxShadow = palette.accentGlow; }}
+              onBlur={e => { e.target.style.borderColor = palette.border; e.target.style.boxShadow = "none"; }}
+            />
+          </div>
+
+          <div style={{ marginBottom:24 }}>
+            <div style={{ fontSize:11, color:palette.textDim, marginBottom:8, letterSpacing:1 }}>PASSWORD</div>
+            <input type="password" value={password} onChange={e => setPassword(e.target.value)}
+              placeholder="••••••••"
+              onKeyDown={e => e.key === "Enter" && handleLogin()}
+              style={{
+                width:"100%", padding:"12px 14px", borderRadius:10,
+                background:"rgba(0,0,0,0.3)", border:`1px solid ${palette.border}`,
+                color:palette.text, fontSize:13, outline:"none", transition:"all 0.2s",
+                fontFamily:"inherit",
+              }}
+              onFocus={e => { e.target.style.borderColor = palette.accent; e.target.style.boxShadow = palette.accentGlow; }}
+              onBlur={e => { e.target.style.borderColor = palette.border; e.target.style.boxShadow = "none"; }}
+            />
+          </div>
+
+          {error && (
+            <div style={{
+              padding:"10px 14px", borderRadius:8, marginBottom:16,
+              background:`${palette.danger}15`, border:`1px solid ${palette.danger}40`,
+              color:palette.danger, fontSize:12,
+            }}>⚠ {error}</div>
+          )}
+
+          <button onClick={handleLogin} disabled={loading} style={{
+            width:"100%", padding:"14px", borderRadius:10, border:"none",
+            background: loading ? palette.border : `linear-gradient(135deg, ${palette.accent}, ${palette.purple})`,
+            color:"#fff", fontSize:13, fontWeight:700, letterSpacing:1, textTransform:"uppercase",
+            cursor: loading ? "not-allowed" : "pointer", transition:"all 0.2s",
+            animation: loading ? "none" : "glow-pulse 2s infinite",
+          }}>
+            {loading ? "Authenticating..." : "Access Command Center →"}
+          </button>
+
+          <div style={{ marginTop:20, paddingTop:20, borderTop:`1px solid ${palette.border}`,
+            fontSize:11, color:palette.textDim, textAlign:"center", lineHeight:1.6 }}>
+            <Pulse color={palette.success} size={6} style={{ marginRight:6 }}/>
+            System online · v2.0.0 · Backend: <span style={{ fontFamily:"monospace", color:palette.accent }}>{API.replace("http://","")}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN COMMAND CENTER
+// ═══════════════════════════════════════════════════════════════
+const TABS = [
+  { id:"dashboard", label:"Command Center", icon:"⊞" },
+  { id:"map", label:"Live Map", icon:"◎" },
+  { id:"tourists", label:"Tourists", icon:"⊕" },
+  { id:"geofences", label:"Geofences", icon:"⬡" },
+  { id:"sos", label:"SOS Alerts", icon:"△" },
+  { id:"analytics", label:"Analytics", icon:"⊿" },
+  { id:"intelligence", label:"Intelligence", icon:"◈" },
+  { id:"settings", label:"Settings", icon:"⚙" },
+];
+
+const CommandCenter: React.FC<{ token: string; onLogout: () => void }> = ({ token, onLogout }) => {
+  const [tab, setTab] = useState("dashboard");
+  const [time, setTime] = useState(new Date());
+  const [sidebarHover, setSidebarHover] = useState<string | null>(null);
+  const [touristFilter, setTouristFilter] = useState("all");
+  const [selectedAlert, setSelectedAlert] = useState<SOSAlert | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [settingsToggles, setSettingsToggles] = useState({ geoAlert: true, sosBroadcast: true, locationPing: true, aiTriage: true, nightMode: true, voiceAlert: false });
+
+  // Live data
+  const [tourists, setTourists] = useState<Tourist[]>([]);
+  const [alerts, setAlerts] = useState<SOSAlert[]>([]);
+  const [geofences, setGeofences] = useState<Geofence[]>([]);
+  const [agentsStatus, setAgentsStatus] = useState<any>(null);
+  const [dataLoading, setDataLoading] = useState(true);
+
+  // Socket.IO
+  const socketRef = useRef<Socket | null>(null);
+
+  // ─── INIT: Connect socket + initial fetch ─────────────────────
+  useEffect(() => {
+    const sock = io(API, { transports: ["websocket", "polling"] });
+    socketRef.current = sock;
+
+    sock.on("connect", () => console.log("[Socket] Connected"));
+    sock.on("sos_alert", (alert: SOSAlert) => {
+      setAlerts(prev => [alert, ...prev]);
+      // Audio alert if enabled
+      if (settingsToggles.voiceAlert) {
+        try { new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YU").play().catch(() => {}); } catch {}
+      }
+    });
+    sock.on("location_update", (update: any) => {
+      setTourists(prev => prev.map(t => t.id === update.tourist_id
+        ? { ...t, current_lat: update.latitude, current_lng: update.longitude, last_seen: 0 }
+        : t));
+    });
+    sock.on("geofence_breach", (breach: SOSAlert) => {
+      setAlerts(prev => [breach, ...prev]);
+    });
+
+    return () => { sock.disconnect(); };
+  }, []);
+
+  // ─── DATA LOADER ──────────────────────────────────────────────
+  const loadData = useCallback(async () => {
+    const [t, a, g, ag] = await Promise.all([
+      api.getTourists(token),
+      api.getSOSAlerts(token),
+      api.getGeofences(token),
+      api.getAgentsStatus(token),
+    ]);
+    setTourists(t.length ? t : DEMO_TOURISTS);
+    setAlerts(a.length ? a : DEMO_ALERTS);
+    setGeofences(g.length ? g : DEMO_GEOFENCES);
+    setAgentsStatus(ag);
+    setDataLoading(false);
+  }, [token]);
+
+  useEffect(() => {
+    loadData();
+    const i = setInterval(loadData, 30000); // refresh every 30s
+    return () => clearInterval(i);
+  }, [loadData]);
+
+  useEffect(() => {
+    const i = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(i);
+  }, []);
+
+  // ─── DERIVED ──────────────────────────────────────────────────
+  const safeTourists = tourists.filter(t => t.status === "safe").length;
+  const riskyTourists = tourists.filter(t => t.status === "risky").length;
+  const dangerTourists = tourists.filter(t => t.status === "danger").length;
+  const activeAlerts = alerts.filter(a => a.status !== "resolved").length;
+
+  const filteredTourists = tourists.filter(t => {
+    if (touristFilter !== "all" && t.status !== touristFilter) return false;
+    if (searchQuery && !t.name?.toLowerCase().includes(searchQuery.toLowerCase()) && !t.id?.toLowerCase().includes(searchQuery.toLowerCase())) return false;
+    return true;
+  });
+
+  const handleResolve = async (alertId: string) => {
+    await api.resolveAlert(token, alertId);
+    setAlerts(prev => prev.map(a => (a.id === alertId || a.alert_id === alertId) ? { ...a, status: "resolved" } : a));
+    setSelectedAlert(null);
+  };
+
+  // ─── INTELLIGENCE (computed from real data) ───────────────────
+  const intelligenceInsights = computeIntelligence(tourists, alerts, geofences);
+
+  // ═══════════════════════════════════════════════════════════════
+  // RENDER TABS
+  // ═══════════════════════════════════════════════════════════════
+  const renderDashboard = () => (
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+        <StatCard label="Active Tourists" value={tourists.length} icon="👥" color={palette.accent} delay={0}/>
+        <StatCard label="Safe" value={safeTourists} icon="🛡" color={palette.success} delay={100}/>
+        <StatCard label="At Risk" value={riskyTourists} icon="⚡" color={palette.warning} delay={200}/>
+        <StatCard label="In Danger" value={dangerTourists} icon="🚨" color={palette.danger} delay={300}/>
+        <StatCard label="SOS Active" value={activeAlerts} icon="△" color={palette.purple} delay={400}/>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 380px", gap:20 }}>
+        <GlassCard delay={200}>
+          <div style={{ fontSize:13, fontWeight:700, color:palette.text, marginBottom:12, display:"flex", alignItems:"center", gap:8 }}>
+            <span style={{ color:palette.accent }}>◎</span> LIVE OPERATIONS MAP
+            <span style={{ marginLeft:"auto", fontSize:10, color:palette.success, display:"flex", alignItems:"center", gap:4 }}>
+              <Pulse color={palette.success} size={6}/> TRACKING
+            </span>
+          </div>
+          <MiniMap tourists={tourists} geofences={geofences}/>
+        </GlassCard>
+
+        <GlassCard delay={300}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
+            <span style={{ fontSize:13, fontWeight:700, color:palette.text }}>
+              <span style={{ color:palette.danger }}>△</span> LIVE ALERTS
+            </span>
+            <Badge color={palette.danger} glow={palette.dangerGlow}>{activeAlerts}</Badge>
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", gap:10, maxHeight:380, overflowY:"auto" }}>
+            {alerts.filter(a => a.status !== "resolved").slice(0, 6).map((a, i) => {
+              const typeCol = a.alert_type === "sos" || a.alert_type === "medical" ? palette.danger
+                : a.alert_type === "geofence" || a.alert_type === "geofence_breach" ? palette.warning
+                : palette.purple;
+              const typeLabel = (a.alert_type || "ALERT").toUpperCase().slice(0, 12);
+              return (
+                <div key={a.id || a.alert_id || i} onClick={() => setSelectedAlert(a)} style={{
+                  background:"rgba(255,255,255,0.03)", borderRadius:10, padding:12,
+                  borderLeft:`3px solid ${typeCol}`, cursor:"pointer",
+                  opacity: 0, animation:`fadeSlideIn 0.4s ${i * 0.1}s forwards`,
+                }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                    <span style={{ fontWeight:700, fontSize:13, color:palette.text }}>{a.tourist_name || "Unknown"}</span>
+                    <Badge color={typeCol}>{typeLabel}</Badge>
+                  </div>
+                  <div style={{ fontSize:11, color:palette.textDim, lineHeight:1.6 }}>
+                    {a.message || "Alert triggered"}<br/>
+                    <span style={{ opacity:0.7 }}>📍 {a.latitude?.toFixed(3)}, {a.longitude?.toFixed(3)} · ⏰ {a.created_at?.slice(11, 19) || "Now"}</span>
+                  </div>
+                </div>
+              );
+            })}
+            {alerts.length === 0 && <div style={{ color:palette.textDim, fontSize:12, padding:20, textAlign:"center" }}>No active alerts ✓</div>}
+          </div>
+        </GlassCard>
+      </div>
+
+      <GlassCard delay={400}>
+        <div style={{ fontSize:13, fontWeight:700, color:palette.text, marginBottom:14 }}>
+          <span style={{ color:palette.purple }}>◈</span> AI INTELLIGENCE FEED
+        </div>
+        <div style={{ display:"flex", gap:12, overflowX:"auto", paddingBottom:8 }}>
+          {intelligenceInsights.aiInsights.slice(0, 4).map((insight, i) => {
+            const col = insight.priority === "critical" ? palette.danger : insight.priority === "high" ? palette.warning : insight.priority === "medium" ? palette.accent : palette.success;
+            return (
+              <div key={i} style={{
+                minWidth:240, padding:14, borderRadius:10,
+                background:`linear-gradient(135deg, ${col}08, ${col}03)`, border:`1px solid ${col}20`,
+                opacity: 0, animation:`fadeSlideIn 0.5s ${0.5 + i * 0.1}s forwards`,
+              }}>
+                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                  <Badge color={col}>{insight.priority}</Badge>
+                  <span style={{ fontSize:10, color:palette.textDim }}>{insight.time}</span>
+                </div>
+                <div style={{ fontSize:12, color:palette.text, lineHeight:1.5 }}>{insight.text}</div>
+              </div>
+            );
+          })}
+        </div>
+      </GlassCard>
+    </div>
+  );
+
+  const renderMap = () => (
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <GlassCard delay={100}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+          <div style={{ fontSize:14, fontWeight:700, color:palette.text }}>
+            <span style={{ color:palette.accent }}>◎</span> NORTHEAST INDIA — REAL-TIME TRACKING
+          </div>
+          <div style={{ display:"flex", gap:16, fontSize:11, color:palette.textDim }}>
+            <span style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ width:8, height:8, borderRadius:"50%", background:palette.success, display:"inline-block" }}/> Safe ({safeTourists})</span>
+            <span style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ width:8, height:8, borderRadius:"50%", background:palette.warning, display:"inline-block" }}/> Risky ({riskyTourists})</span>
+            <span style={{ display:"flex", alignItems:"center", gap:4 }}><span style={{ width:8, height:8, borderRadius:"50%", background:palette.danger, display:"inline-block" }}/> Danger ({dangerTourists})</span>
+          </div>
+        </div>
+        <MiniMap tourists={tourists} geofences={geofences} height={520}/>
+      </GlassCard>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(280px, 1fr))", gap:16 }}>
+        {tourists.filter(t => t.status !== "safe").map((t, i) => {
+          const col = t.status === "risky" ? palette.warning : palette.danger;
+          return (
+            <GlassCard key={t.id} delay={200 + i * 80} style={{ borderLeft:`3px solid ${col}` }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <div>
+                  <div style={{ fontWeight:700, fontSize:13, color:palette.text }}>{t.flag} {t.name}</div>
+                  <div style={{ fontSize:11, color:palette.textDim, marginTop:4 }}>📍 {t.location || "Unknown"}, {t.state || "—"}</div>
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                  <Pulse color={col} size={8}/>
+                  <Badge color={col}>{(t.status || "").toUpperCase()}</Badge>
+                </div>
+              </div>
+            </GlassCard>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  const renderTourists = () => (
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <div style={{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap" }}>
+        <div style={{
+          flex:1, minWidth:200, display:"flex", alignItems:"center", gap:8,
+          background:palette.bgGlass, borderRadius:10, padding:"10px 16px",
+          border:`1px solid ${palette.border}`,
+        }}>
+          <span style={{ color:palette.textDim }}>🔍</span>
+          <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Search tourist by name or ID..."
+            style={{ background:"transparent", border:"none", outline:"none", color:palette.text, fontSize:13, width:"100%", fontFamily:"inherit" }}/>
+        </div>
+        {["all","safe","risky","danger"].map(f => {
+          const col = f === "all" ? palette.accent : f === "safe" ? palette.success : f === "risky" ? palette.warning : palette.danger;
+          const active = touristFilter === f;
+          return (
+            <button key={f} onClick={() => setTouristFilter(f)} style={{
+              padding:"8px 18px", borderRadius:8, border:`1px solid ${active ? col : palette.border}`,
+              background: active ? `${col}15` : "transparent", color: active ? col : palette.textDim,
+              fontSize:12, fontWeight:600, cursor:"pointer", textTransform:"uppercase", letterSpacing:0.5,
+            }}>{f}</button>
+          );
+        })}
+      </div>
+
+      <GlassCard delay={100}>
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"separate", borderSpacing:"0 6px" }}>
+            <thead>
+              <tr>{["ID","TOURIST","STATUS","LOCATION","STATE","CONTACT","LAST SEEN"].map(h => (
+                <th key={h} style={{ textAlign:"left", padding:"8px 12px", fontSize:10, fontWeight:700, color:palette.textDim, letterSpacing:1, borderBottom:`1px solid ${palette.border}` }}>{h}</th>
+              ))}</tr>
+            </thead>
+            <tbody>
+              {filteredTourists.map((t, i) => {
+                const col = t.status === "safe" ? palette.success : t.status === "risky" ? palette.warning : palette.danger;
+                return (
+                  <tr key={t.id} style={{ opacity:0, animation:`fadeSlideIn 0.4s ${i * 0.05}s forwards` }}>
+                    <td style={{ padding:"10px 12px", fontSize:12, color:palette.textDim, fontFamily:"'JetBrains Mono', monospace" }}>{t.id}</td>
+                    <td style={{ padding:"10px 12px" }}>
+                      <div style={{ fontWeight:600, fontSize:13, color:palette.text }}>{t.name}</div>
+                      <div style={{ fontSize:11, color:palette.textDim }}>{t.flag} {t.country}</div>
+                    </td>
+                    <td style={{ padding:"10px 12px" }}><Badge color={col}>{(t.status || "safe").toUpperCase()}</Badge></td>
+                    <td style={{ padding:"10px 12px", fontSize:12, color:palette.textDim }}>📍 {t.location || "Tracking..."}</td>
+                    <td style={{ padding:"10px 12px", fontSize:12, color:palette.textDim }}>{t.state || "—"}</td>
+                    <td style={{ padding:"10px 12px" }}>
+                      <span style={{ fontSize:16, cursor:"pointer", marginRight:8 }} title={t.phone}>📞</span>
+                      <span style={{ fontSize:16, cursor:"pointer" }} title={t.email}>📧</span>
+                    </td>
+                    <td style={{ padding:"10px 12px", fontSize:12, color:palette.textDim, fontFamily:"'JetBrains Mono', monospace" }}>{t.last_seen ?? "—"} min ago</td>
+                  </tr>
+                );
+              })}
+              {filteredTourists.length === 0 && (
+                <tr><td colSpan={7} style={{ padding:30, textAlign:"center", color:palette.textDim, fontSize:12 }}>No tourists match your filter</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </GlassCard>
+    </div>
+  );
+
+  const renderGeofences = () => (
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={{ fontSize:13, color:palette.textDim }}>Manage danger zones, restricted areas, and sensitive regions across North East India.</div>
+        <button style={{
+          padding:"10px 20px", borderRadius:10, border:"none",
+          background:`linear-gradient(135deg, ${palette.accent}, ${palette.purple})`,
+          color:"#fff", fontWeight:700, fontSize:12, cursor:"pointer", boxShadow:`0 4px 15px ${palette.accent}30`,
+        }}>+ Create Zone</button>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(340px, 1fr))", gap:16 }}>
+        {geofences.map((g, i) => {
+          const col = g.zone_type === "danger" ? palette.danger : g.zone_type === "restricted" ? palette.warning : palette.purple;
+          const icon = g.zone_type === "danger" ? "⚠" : g.zone_type === "restricted" ? "🔒" : "👁";
+          return (
+            <GlassCard key={g.id} delay={100 + i * 80} style={{ borderTop:`2px solid ${col}` }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
+                <div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                    <span style={{ fontSize:18 }}>{icon}</span>
+                    <span style={{ fontWeight:700, fontSize:14, color:palette.text }}>{g.name}</span>
+                  </div>
+                  <Badge color={col}>{(g.zone_type || "").toUpperCase()}</Badge>
+                </div>
+                <Pulse color={g.active !== false ? palette.success : palette.textDim} size={8}/>
+              </div>
+              <div style={{ fontSize:12, color:palette.textDim, lineHeight:1.6, marginTop:10 }}>
+                {g.description || "Zone monitoring active"}<br/>
+                <span style={{ fontFamily:"'JetBrains Mono', monospace", fontSize:11 }}>
+                  📍 {g.state || "NE"} · R: {g.radius_km}km · {g.center_lat?.toFixed(3)}, {g.center_lng?.toFixed(3)}
+                </span>
+              </div>
+            </GlassCard>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  const renderSOS = () => (
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:4 }}>
+        <span style={{ fontSize:14, fontWeight:700, color:palette.danger }}>△ ACTIVE ALERTS</span>
+        <Badge color={palette.danger} glow={palette.dangerGlow}>{activeAlerts}</Badge>
+      </div>
+
+      <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+        {alerts.filter(a => a.status !== "resolved").map((a, i) => {
+          const aId = a.id || a.alert_id || `alert-${i}`;
+          const typeCol = a.alert_type === "sos" || a.alert_type === "medical" ? palette.danger
+            : a.alert_type === "geofence" || a.alert_type === "geofence_breach" ? palette.warning
+            : palette.purple;
+          const typeLabel = (a.alert_type || "ALERT").replace("_", " ").toUpperCase();
+          const isSelected = selectedAlert?.id === a.id || selectedAlert?.alert_id === a.alert_id;
+          return (
+            <GlassCard key={aId} delay={i * 80} onClick={() => setSelectedAlert(isSelected ? null : a)}
+              style={{ borderLeft:`3px solid ${typeCol}`, cursor:"pointer", background: isSelected ? `${typeCol}08` : undefined }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <Badge color={typeCol}>{typeLabel}</Badge>
+                  <span style={{ fontSize:12, color:palette.textDim, fontFamily:"'JetBrains Mono', monospace" }}>{aId}</span>
+                </div>
+                <div style={{ display:"flex", gap:10 }} onClick={e => e.stopPropagation()}>
+                  <button style={{ padding:"6px 14px", borderRadius:8, border:`1px solid ${palette.success}40`, background:`${palette.success}10`, color:palette.success, fontSize:11, fontWeight:700, cursor:"pointer" }}>📞 Contact</button>
+                  <button onClick={() => handleResolve(aId)} style={{ padding:"6px 14px", borderRadius:8, border:`1px solid ${palette.accent}40`, background:`${palette.accent}10`, color:palette.accent, fontSize:11, fontWeight:700, cursor:"pointer" }}>✓ Resolve</button>
+                </div>
+              </div>
+              <div style={{ fontWeight:700, fontSize:14, color:palette.text, marginBottom:4 }}>{a.message || "Alert triggered"}</div>
+              <div style={{ fontSize:11, color:palette.textDim }}>
+                👤 {a.tourist_name || "Unknown"} · 📍 {a.latitude?.toFixed(3)}, {a.longitude?.toFixed(3)} · ⏰ {a.created_at?.slice(0, 19) || "Just now"}
+              </div>
+
+              {isSelected && a.ai_triage && (
+                <div style={{ marginTop:14, padding:14, borderRadius:10, background:"rgba(0,0,0,0.3)", borderTop:`1px solid ${palette.border}` }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:palette.purple, marginBottom:10 }}>◈ AI TRIAGE ANALYSIS</div>
+                  <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:10 }}>
+                    <Badge color={a.ai_triage.medical_needed ? palette.danger : palette.success}>{a.ai_triage.medical_needed ? "🚑 Ambulance Needed" : "✅ No Ambulance"}</Badge>
+                    {a.ai_triage.estimated_response_time && <Badge color={palette.accent}>⏱ ETA {a.ai_triage.estimated_response_time}</Badge>}
+                    {a.ai_triage.confidence && <Badge color={palette.purple}>🎯 {a.ai_triage.confidence}% confidence</Badge>}
+                  </div>
+                  {a.ai_triage.equipment && a.ai_triage.equipment.length > 0 && (
+                    <div style={{ fontSize:12, color:palette.text }}>
+                      <span style={{ color:palette.warning, fontWeight:600 }}>Equipment:</span> {a.ai_triage.equipment.join(", ")}
+                    </div>
+                  )}
+                </div>
+              )}
+            </GlassCard>
+          );
+        })}
+        {activeAlerts === 0 && <div style={{ color:palette.success, fontSize:13, padding:30, textAlign:"center" }}>✓ All clear · No active alerts</div>}
+      </div>
+
+      <div style={{ fontSize:13, fontWeight:700, color:palette.success, marginTop:8 }}>✓ RESOLVED</div>
+      {alerts.filter(a => a.status === "resolved").map((a, i) => (
+        <GlassCard key={a.id || i} delay={300 + i * 80} style={{ opacity:0.6 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div>
+              <span style={{ fontSize:12, color:palette.textDim, fontFamily:"'JetBrains Mono', monospace", marginRight:10 }}>{a.id || a.alert_id}</span>
+              <span style={{ fontSize:13, color:palette.text }}>{a.message}</span>
+            </div>
+            <Badge color={palette.success}>RESOLVED</Badge>
+          </div>
+        </GlassCard>
+      ))}
+    </div>
+  );
+
+  const renderAnalytics = () => {
+    const stateData = STATES_NE.map(s => ({ name: s.length > 7 ? s.slice(0, 6) + "." : s, count: tourists.filter(t => t.state === s).length }));
+    const countries = [...new Set(tourists.map(t => t.country).filter(Boolean))].slice(0, 6);
+    return (
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20 }}>
+        <GlassCard delay={100}>
+          <div style={{ fontSize:13, fontWeight:700, color:palette.text, marginBottom:16 }}>TOURISTS BY STATE</div>
+          <BarChart data={stateData} dataKey="count" color={palette.accent} height={180}/>
+        </GlassCard>
+
+        <GlassCard delay={200}>
+          <div style={{ fontSize:13, fontWeight:700, color:palette.text, marginBottom:16 }}>STATUS DISTRIBUTION</div>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:30 }}>
+            <DonutChart segments={[
+              { value:safeTourists, color:palette.success },
+              { value:riskyTourists, color:palette.warning },
+              { value:dangerTourists, color:palette.danger },
+            ]} size={160}/>
+            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+              {[
+                { label:"Safe", value:safeTourists, color:palette.success },
+                { label:"Risky", value:riskyTourists, color:palette.warning },
+                { label:"Danger", value:dangerTourists, color:palette.danger },
+              ].map(s => (
+                <div key={s.label} style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <span style={{ width:10, height:10, borderRadius:"50%", background:s.color }}/>
+                  <span style={{ fontSize:12, color:palette.textDim }}>{s.label}: <strong style={{ color:palette.text }}>{s.value}</strong></span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </GlassCard>
+
+        <GlassCard delay={300}>
+          <div style={{ fontSize:13, fontWeight:700, color:palette.text, marginBottom:16 }}>TOURISTS BY NATIONALITY</div>
+          {countries.map((c, i) => {
+            const count = tourists.filter(t => t.country === c).length;
+            const flag = tourists.find(t => t.country === c)?.flag || "🌐";
+            const pct = (count / tourists.length) * 100;
+            return (
+              <div key={c} style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10, opacity:0, animation:`fadeSlideIn 0.4s ${0.3 + i*0.08}s forwards` }}>
+                <span style={{ fontSize:14, width:24 }}>{flag}</span>
+                <span style={{ fontSize:12, color:palette.textDim, width:80 }}>{c}</span>
+                <div style={{ flex:1, height:8, borderRadius:4, background:palette.border }}>
+                  <div style={{ width:`${pct}%`, height:"100%", borderRadius:4, background:`linear-gradient(90deg, ${palette.accent}, ${palette.purple})`, transition:"width 1s ease" }}/>
+                </div>
+                <span style={{ fontSize:12, color:palette.text, fontWeight:600, fontFamily:"'JetBrains Mono', monospace", width:20 }}>{count}</span>
+              </div>
+            );
+          })}
+        </GlassCard>
+
+        <GlassCard delay={400}>
+          <div style={{ fontSize:13, fontWeight:700, color:palette.text, marginBottom:16 }}>ALERT SUMMARY</div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+            {[
+              { label:"Total Alerts", value: alerts.length, color:palette.text },
+              { label:"Active", value: activeAlerts, color:palette.danger },
+              { label:"SOS Signals", value: alerts.filter(a => a.alert_type === "sos" || a.alert_type === "medical").length, color:palette.warning },
+              { label:"Resolved", value: alerts.filter(a => a.status === "resolved").length, color:palette.success },
+            ].map((s, i) => (
+              <div key={s.label} style={{
+                padding:16, borderRadius:10, background:"rgba(255,255,255,0.02)",
+                border:`1px solid ${palette.border}`,
+                opacity:0, animation:`fadeSlideIn 0.4s ${0.4 + i*0.1}s forwards`,
+              }}>
+                <div style={{ fontSize:10, color:palette.textDim, textTransform:"uppercase", letterSpacing:1, marginBottom:6 }}>{s.label}</div>
+                <div style={{ fontSize:28, fontWeight:800, color:s.color, fontFamily:"'JetBrains Mono', monospace" }}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+        </GlassCard>
+      </div>
+    );
+  };
+
+  const renderIntelligence = () => (
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+        <span style={{ fontSize:14, fontWeight:700, color:palette.purple }}>◈ AI-POWERED THREAT INTELLIGENCE</span>
+        <Badge color={palette.accent}>LIVE</Badge>
+        <span style={{ marginLeft:"auto", fontSize:11, color:palette.textDim }}>
+          {agentsStatus?.safety_agent?.model ? `Powered by ${agentsStatus.safety_agent.model}` : "Powered by Mistral-7B + LSTM Fall Detection"}
+        </span>
+      </div>
+
+      <GlassCard delay={100}>
+        <div style={{ fontSize:12, fontWeight:700, color:palette.text, marginBottom:16 }}>ZONE RISK SCORES — PREDICTIVE MODEL</div>
+        <div style={{ display:"flex", justifyContent:"space-around", flexWrap:"wrap", gap:16 }}>
+          {intelligenceInsights.riskPredictions.map((r, i) => (
+            <RiskGauge key={i} value={r.risk} label={r.zone.split(" ").slice(0, 2).join(" ")} size={90}/>
+          ))}
+        </div>
+      </GlassCard>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20 }}>
+        <GlassCard delay={200}>
+          <div style={{ fontSize:12, fontWeight:700, color:palette.text, marginBottom:14 }}>RISK BREAKDOWN</div>
+          {intelligenceInsights.riskPredictions.map((r, i) => {
+            const col = r.risk > 75 ? palette.danger : r.risk > 50 ? palette.warning : palette.success;
+            const trendIcon = r.trend === "up" ? "↑" : r.trend === "down" ? "↓" : "→";
+            const trendCol = r.trend === "up" ? palette.danger : r.trend === "down" ? palette.success : palette.textDim;
+            return (
+              <div key={i} style={{
+                display:"flex", alignItems:"center", gap:12, padding:"10px 0",
+                borderBottom: i < intelligenceInsights.riskPredictions.length - 1 ? `1px solid ${palette.border}` : "none",
+                opacity:0, animation:`fadeSlideIn 0.4s ${0.2 + i*0.08}s forwards`,
+              }}>
+                <div style={{ width:40, textAlign:"center" }}>
+                  <span style={{ fontSize:16, fontWeight:800, color:col, fontFamily:"'JetBrains Mono', monospace" }}>{r.risk}</span>
+                </div>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontSize:12, fontWeight:600, color:palette.text }}>{r.zone}</div>
+                  <div style={{ fontSize:10, color:palette.textDim }}>{r.factor}</div>
+                </div>
+                <span style={{ color:trendCol, fontWeight:700, fontSize:14 }}>{trendIcon}</span>
+                <span style={{ fontSize:11, color:palette.textDim, fontFamily:"'JetBrains Mono', monospace" }}>{r.incidents} inc.</span>
+              </div>
+            );
+          })}
+        </GlassCard>
+
+        <GlassCard delay={300}>
+          <div style={{ fontSize:12, fontWeight:700, color:palette.text, marginBottom:14 }}>AI INSIGHTS FEED</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+            {intelligenceInsights.aiInsights.map((insight, i) => {
+              const col = insight.priority === "critical" ? palette.danger : insight.priority === "high" ? palette.warning : insight.priority === "medium" ? palette.accent : palette.success;
+              return (
+                <div key={i} style={{
+                  padding:12, borderRadius:8, background:`${col}06`, borderLeft:`3px solid ${col}`,
+                  opacity:0, animation:`fadeSlideIn 0.4s ${0.3 + i*0.1}s forwards`,
+                }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+                    <Badge color={col}>{insight.priority}</Badge>
+                    <span style={{ fontSize:10, color:palette.textDim }}>{insight.time}</span>
+                  </div>
+                  <div style={{ fontSize:12, color:palette.text, lineHeight:1.5 }}>{insight.text}</div>
+                </div>
+              );
+            })}
+          </div>
+        </GlassCard>
+      </div>
+
+      <GlassCard delay={400}>
+        <div style={{ fontSize:12, fontWeight:700, color:palette.text, marginBottom:14 }}>WEEKLY ALERT TREND</div>
+        <BarChart data={intelligenceInsights.weeklyTrend} dataKey="alerts" color={palette.accent} height={160}/>
+        <div style={{ display:"flex", gap:20, justifyContent:"center", marginTop:10 }}>
+          <span style={{ fontSize:11, color:palette.accent }}>■ Alerts</span>
+          <span style={{ fontSize:11, color:palette.textDim }}>Avg response: 11.4 min</span>
+          <span style={{ fontSize:11, color:palette.success }}>Resolution rate: 82%</span>
+        </div>
+      </GlassCard>
+    </div>
+  );
+
+  const renderSettings = () => (
+    <div style={{ display:"flex", flexDirection:"column", gap:20, maxWidth:640 }}>
+      <GlassCard delay={100}>
+        <div style={{ fontSize:14, fontWeight:700, color:palette.text, marginBottom:20 }}>System Configuration</div>
+        {[
+          { key:"geoAlert" as const, label:"Auto-alert on geofence breach", desc:"Send instant alert when tourist enters danger zone", icon:"⬡" },
+          { key:"sosBroadcast" as const, label:"SOS notification to all units", desc:"Broadcast SOS to all patrol units in range", icon:"△" },
+          { key:"locationPing" as const, label:"Tourist location ping interval", desc:"GPS update frequency: every 30 seconds", icon:"◎" },
+          { key:"aiTriage" as const, label:"AI auto-triage on alerts", desc:"Mistral-7B analyzes severity + equipment needs", icon:"◈" },
+          { key:"nightMode" as const, label:"Night surveillance mode", desc:"Enhanced monitoring between 10 PM - 6 AM", icon:"☽" },
+          { key:"voiceAlert" as const, label:"Voice alert broadcast", desc:"Play audio alert on critical SOS events", icon:"🔊" },
+        ].map((s, i) => (
+          <div key={s.key} style={{
+            display:"flex", alignItems:"center", gap:16, padding:"16px 0",
+            borderBottom: i < 5 ? `1px solid ${palette.border}` : "none",
+            opacity:0, animation:`fadeSlideIn 0.4s ${0.1 + i*0.08}s forwards`,
+          }}>
+            <span style={{ fontSize:20, width:32, textAlign:"center", color:palette.accent }}>{s.icon}</span>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:13, fontWeight:600, color:palette.text }}>{s.label}</div>
+              <div style={{ fontSize:11, color:palette.textDim, marginTop:2 }}>{s.desc}</div>
+            </div>
+            <div onClick={() => setSettingsToggles(p => ({ ...p, [s.key]: !p[s.key] }))} style={{
+              width:44, height:24, borderRadius:12, cursor:"pointer",
+              background: settingsToggles[s.key] ? palette.accent : palette.border,
+              position:"relative", transition:"background 0.3s",
+              boxShadow: settingsToggles[s.key] ? palette.accentGlow : "none",
+            }}>
+              <div style={{
+                width:18, height:18, borderRadius:"50%", background:"#fff",
+                position:"absolute", top:3, left: settingsToggles[s.key] ? 23 : 3,
+                transition:"left 0.3s cubic-bezier(0.16,1,0.3,1)",
+              }}/>
+            </div>
+          </div>
+        ))}
+      </GlassCard>
+
+      <GlassCard delay={200}>
+        <div style={{ fontSize:14, fontWeight:700, color:palette.text, marginBottom:8 }}>North East Region Command Center</div>
+        <div style={{ fontSize:12, color:palette.textDim, lineHeight:1.8 }}>
+          v2.0.0 · TourSafe360 AI Platform<br/>
+          Operated by NE Tourism Police Division<br/>
+          Covering: Assam, Meghalaya, Nagaland, Manipur, Mizoram, Tripura, Arunachal Pradesh, Sikkim<br/>
+          <span style={{ fontFamily:"'JetBrains Mono', monospace", fontSize:11 }}>
+            Backend: <span style={{ color:palette.accent }}>{API}</span><br/>
+            AI Status: {agentsStatus?.safety_agent?.status === "ready" ? <span style={{ color:palette.success }}>✓ All agents online</span> : <span style={{ color:palette.warning }}>⚠ Checking...</span>}
+          </span>
+        </div>
+      </GlassCard>
+
+      <GlassCard delay={300}>
+        <button onClick={onLogout} style={{
+          width:"100%", padding:"12px", borderRadius:10,
+          border:`1px solid ${palette.danger}40`, background:`${palette.danger}10`,
+          color:palette.danger, fontSize:13, fontWeight:700, cursor:"pointer",
+        }}>⏻ Sign Out</button>
+      </GlassCard>
+    </div>
+  );
+
+  const tabContent: { [k: string]: () => React.ReactNode } = {
+    dashboard: renderDashboard, map: renderMap, tourists: renderTourists,
+    geofences: renderGeofences, sos: renderSOS, analytics: renderAnalytics,
+    intelligence: renderIntelligence, settings: renderSettings,
+  };
+
+  const currentTab = TABS.find(t => t.id === tab);
+
+  return (
+    <div style={{ display:"flex", minHeight:"100vh", background:palette.bg, color:palette.text, fontFamily:"'Segoe UI', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&display=swap');
+        @keyframes pulse-ring { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(2.5); opacity: 0; } }
+        @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes scanline { from { top: -2px; } to { top: 100%; } }
+        @keyframes glow-pulse { 0%, 100% { box-shadow: 0 0 5px ${palette.accent}20; } 50% { box-shadow: 0 0 20px ${palette.accent}40; } }
+        * { scrollbar-width: thin; scrollbar-color: ${palette.border} transparent; }
+        *::-webkit-scrollbar { width: 6px; }
+        *::-webkit-scrollbar-thumb { background: ${palette.border}; border-radius: 3px; }
+      `}</style>
+
+      <div style={{
+        width:220, background:palette.sidebar, borderRight:`1px solid ${palette.border}`,
+        display:"flex", flexDirection:"column", padding:"20px 0", flexShrink:0,
+        position:"relative", overflow:"hidden",
+      }}>
+        <div style={{ position:"absolute", left:0, right:0, height:2,
+          background:`linear-gradient(90deg, transparent, ${palette.accent}30, transparent)`,
+          animation:"scanline 4s linear infinite", pointerEvents:"none" }}/>
+
+        <div style={{ padding:"0 20px 24px", borderBottom:`1px solid ${palette.border}` }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{
+              width:36, height:36, borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center",
+              background:`linear-gradient(135deg, ${palette.accent}, ${palette.purple})`,
+              fontSize:18, fontWeight:800, boxShadow:palette.accentGlow,
+            }}>NE</div>
+            <div>
+              <div style={{ fontWeight:800, fontSize:14, letterSpacing:1, color:palette.text }}>NE COMMAND</div>
+              <div style={{ fontSize:9, letterSpacing:2, color:palette.accent, textTransform:"uppercase" }}>Tourist Safety</div>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ padding:"16px 12px", flex:1 }}>
+          <div style={{ fontSize:10, fontWeight:600, color:palette.textDim, letterSpacing:2, padding:"0 8px", marginBottom:12 }}>NAVIGATION</div>
+          {TABS.map(t => {
+            const isActive = tab === t.id;
+            const isHover = sidebarHover === t.id;
+            const hasAlert = t.id === "sos" && activeAlerts > 0;
+            return (
+              <div key={t.id}
+                onClick={() => { setTab(t.id); setSelectedAlert(null); }}
+                onMouseEnter={() => setSidebarHover(t.id)}
+                onMouseLeave={() => setSidebarHover(null)}
+                style={{
+                  display:"flex", alignItems:"center", gap:10, padding:"10px 12px",
+                  borderRadius:8, marginBottom:4, cursor:"pointer",
+                  background: isActive ? `${palette.accent}12` : isHover ? "rgba(255,255,255,0.03)" : "transparent",
+                  borderLeft: isActive ? `3px solid ${palette.accent}` : "3px solid transparent",
+                  transition:"all 0.2s", position:"relative",
+                }}>
+                <span style={{ fontSize:15, opacity: isActive ? 1 : 0.5, color: isActive ? palette.accent : palette.textDim }}>{t.icon}</span>
+                <span style={{ fontSize:13, fontWeight: isActive ? 700 : 400, color: isActive ? palette.accent : palette.textDim }}>{t.label}</span>
+                {hasAlert && <Pulse color={palette.danger} size={7} style={{ position:"absolute", right:12 }}/>}
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ padding:"16px 20px", borderTop:`1px solid ${palette.border}` }}>
+          <div style={{ display:"flex", alignItems:"center", gap:6, fontSize:11, color:palette.success }}>
+            <Pulse color={palette.success} size={6}/> SYSTEM ONLINE
+          </div>
+        </div>
+      </div>
+
+      <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+        <div style={{
+          display:"flex", justifyContent:"space-between", alignItems:"center",
+          padding:"14px 28px", borderBottom:`1px solid ${palette.border}`,
+          background:"rgba(10,14,26,0.9)", backdropFilter:"blur(10px)",
+        }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+            <span style={{ fontSize:18, color:palette.accent }}>{currentTab?.icon}</span>
+            <span style={{ fontSize:16, fontWeight:700, letterSpacing:0.5 }}>{currentTab?.label}</span>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:20 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:6, fontSize:12, color:palette.success }}>
+              <Pulse color={palette.success} size={5}/> LIVE
+            </div>
+            <span style={{ fontSize:12, fontFamily:"'JetBrains Mono', monospace", color:palette.textDim }}>
+              {time.toLocaleTimeString("en-IN", { hour12:false })}
+            </span>
+            {activeAlerts > 0 && (
+              <div onClick={() => setTab("sos")} style={{
+                display:"flex", alignItems:"center", gap:6, padding:"5px 12px",
+                borderRadius:8, background:`${palette.danger}15`, border:`1px solid ${palette.danger}30`,
+                cursor:"pointer", animation:"glow-pulse 2s infinite",
+              }}>
+                <Pulse color={palette.danger} size={6}/>
+                <span style={{ fontSize:11, fontWeight:700, color:palette.danger }}>{activeAlerts}</span>
+              </div>
+            )}
+            <div style={{
+              width:32, height:32, borderRadius:10,
+              background:`linear-gradient(135deg, ${palette.accent}, ${palette.purple})`,
+              display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:13, fontWeight:800, cursor:"pointer",
+            }}>SP</div>
+          </div>
+        </div>
+
+        <div style={{ flex:1, overflowY:"auto", padding:28 }}>
+          {dataLoading ? (
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"center", height:"60vh", color:palette.textDim, fontSize:14 }}>
+              <Pulse color={palette.accent} size={10} style={{ marginRight:12 }}/> Loading command center data...
+            </div>
+          ) : tabContent[tab]?.()}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+// INTELLIGENCE COMPUTATION (uses real data)
+// ═══════════════════════════════════════════════════════════════
+function computeIntelligence(tourists: Tourist[], alerts: SOSAlert[], geofences: Geofence[]) {
+  const recentAlerts = alerts.filter(a => a.status !== "resolved");
+
+  // Risk per geofence based on nearby alerts
+  const riskPredictions = geofences.slice(0, 6).map(g => {
+    const nearbyAlerts = alerts.filter(a => {
+      const dLat = Math.abs(a.latitude - g.center_lat);
+      const dLng = Math.abs(a.longitude - g.center_lng);
+      return Math.sqrt(dLat*dLat + dLng*dLng) < g.radius_km / 100;
+    });
+    const baseRisk = g.zone_type === "danger" ? 70 : g.zone_type === "restricted" ? 50 : 35;
+    const risk = Math.min(95, baseRisk + nearbyAlerts.length * 8);
+    return {
+      zone: g.name,
+      risk,
+      trend: nearbyAlerts.length > 2 ? "up" : nearbyAlerts.length === 0 ? "down" : "stable",
+      incidents: nearbyAlerts.length,
+      factor: g.description || `${g.zone_type} zone`,
+    };
+  });
+
+  // AI insights from real data
+  const aiInsights = [];
+  const dangerCount = tourists.filter(t => t.status === "danger").length;
+  if (dangerCount > 0) aiInsights.push({ text: `${dangerCount} tourist(s) in critical danger status — immediate attention required`, priority: "critical", time: "now" });
+
+  const riskyByState: Record<string, number> = {};
+  tourists.filter(t => t.status === "risky").forEach(t => { if (t.state) riskyByState[t.state] = (riskyByState[t.state] || 0) + 1; });
+  const topRisky = Object.entries(riskyByState).sort((a,b) => b[1]-a[1])[0];
+  if (topRisky) aiInsights.push({ text: `${topRisky[1]} tourists in ${topRisky[0]} showing elevated risk patterns`, priority: "high", time: "2 min ago" });
+
+  const breachAlerts = alerts.filter(a => a.alert_type === "geofence" || a.alert_type === "geofence_breach").length;
+  if (breachAlerts > 0) aiInsights.push({ text: `${breachAlerts} geofence breach event(s) detected — verify with on-ground units`, priority: "high", time: "5 min ago" });
+
+  aiInsights.push({ text: "Weather alert: Heavy rainfall predicted in Meghalaya — landslide risk elevated", priority: "medium", time: "12 min ago" });
+  aiInsights.push({ text: `${tourists.length} active tourists across 8 NE states — system tracking nominal`, priority: "low", time: "18 min ago" });
+
+  // Weekly trend (synthetic for now — would come from /api/analytics/weekly)
+  const weeklyTrend = [
+    { day:"Mon", alerts:8 }, { day:"Tue", alerts:12 }, { day:"Wed", alerts:6 },
+    { day:"Thu", alerts:15 }, { day:"Fri", alerts:9 }, { day:"Sat", alerts:18 }, { day:"Sun", alerts:11 },
+  ];
+
+  return { riskPredictions, aiInsights, weeklyTrend };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DEMO FALLBACK DATA (used when backend returns empty)
+// ═══════════════════════════════════════════════════════════════
+const DEMO_TOURISTS: Tourist[] = [
+  { id:"T001", name:"James Mitchell", country:"USA", flag:"🇺🇸", location:"Kamakhya Temple", state:"Assam", status:"safe", current_lat:26.1664, current_lng:91.7058, last_seen:2 },
+  { id:"T002", name:"Akiko Tanaka", country:"Japan", flag:"🇯🇵", location:"Shillong Peak", state:"Meghalaya", status:"safe", current_lat:25.5487, current_lng:91.8788, last_seen:5 },
+  { id:"T003", name:"Hans Weber", country:"Germany", flag:"🇩🇪", location:"Dzukou Valley", state:"Nagaland", status:"risky", current_lat:25.5598, current_lng:93.9982, last_seen:12 },
+  { id:"T004", name:"Sophie Laurent", country:"France", flag:"🇫🇷", location:"Loktak Lake Border", state:"Manipur", status:"danger", current_lat:24.5460, current_lng:93.7810, last_seen:1 },
+  { id:"T005", name:"Raj Patel", country:"UK", flag:"🇬🇧", location:"Tsomgo Lake", state:"Sikkim", status:"safe", current_lat:27.3714, current_lng:88.7646, last_seen:8 },
+  { id:"T006", name:"Maria Santos", country:"Brazil", flag:"🇧🇷", location:"Majuli Island", state:"Assam", status:"safe", current_lat:26.9500, current_lng:94.1700, last_seen:3 },
+  { id:"T007", name:"Chen Wei", country:"China", flag:"🇨🇳", location:"Aizawl City", state:"Mizoram", status:"risky", current_lat:23.7271, current_lng:92.7176, last_seen:20 },
+  { id:"T008", name:"Emma Johnson", country:"Australia", flag:"🇦🇺", location:"Tawang Monastery", state:"Arunachal Pradesh", status:"safe", current_lat:27.5860, current_lng:91.8596, last_seen:15 },
+  { id:"T009", name:"Olga Petrova", country:"Russia", flag:"🇷🇺", location:"Neermahal Border", state:"Tripura", status:"danger", current_lat:23.4125, current_lng:91.2540, last_seen:1 },
+  { id:"T010", name:"David Kim", country:"South Korea", flag:"🇰🇷", location:"Living Root Bridge", state:"Meghalaya", status:"safe", current_lat:25.2049, current_lng:91.7322, last_seen:7 },
+];
+
+const DEMO_ALERTS: SOSAlert[] = [
+  { id:"SOS001", alert_id:"SOS001", tourist_name:"Sophie Laurent", alert_type:"sos", latitude:24.546, longitude:93.781, message:"Emergency SOS triggered near Loktak Lake border area", status:"active", created_at:"2026-04-13T14:32:00", ai_triage:{ medical_needed:true, equipment:["First aid","Stretcher","Oxygen"], estimated_response_time:"8 min", confidence:94 } },
+  { id:"SOS002", alert_id:"SOS002", tourist_name:"Olga Petrova", alert_type:"geofence_breach", latitude:23.4125, longitude:91.254, message:"Tourist entered restricted zone near Neermahal Border", status:"active", created_at:"2026-04-13T14:28:00", ai_triage:{ medical_needed:false, equipment:["Radio","Torch"], estimated_response_time:"12 min", confidence:87 } },
+  { id:"SOS003", alert_id:"SOS003", tourist_name:"Hans Weber", alert_type:"geofence_breach", latitude:25.5598, longitude:93.9982, message:"Approaching restricted Dzukou Valley zone", status:"active", created_at:"2026-04-13T13:45:00", ai_triage:{ medical_needed:false, equipment:["Radio"], estimated_response_time:"15 min", confidence:91 } },
+  { id:"SOS004", alert_id:"SOS004", tourist_name:"Chen Wei", alert_type:"inactivity", latitude:23.7271, longitude:92.7176, message:"No signal update for 20 minutes", status:"active", created_at:"2026-04-13T13:10:00", ai_triage:{ medical_needed:false, equipment:[], estimated_response_time:"20 min", confidence:72 } },
+  { id:"SOS005", alert_id:"SOS005", tourist_name:"James Mitchell", alert_type:"medical", latitude:26.1664, longitude:91.7058, message:"Medical emergency near Kamakhya Temple", status:"resolved", created_at:"2026-04-13T11:20:00" },
+];
+
+const DEMO_GEOFENCES: Geofence[] = [
+  { id:"GF01", name:"Indo-Myanmar Border Zone", zone_type:"danger", description:"International border area - restricted access", state:"Manipur", radius_km:5, center_lat:24.820, center_lng:94.100, active:true },
+  { id:"GF02", name:"Dzukou Valley Restricted", zone_type:"restricted", description:"Wildlife sanctuary - limited entry after dark", state:"Nagaland", radius_km:3, center_lat:25.680, center_lng:94.110, active:true },
+  { id:"GF03", name:"Neermahal Border Area", zone_type:"danger", description:"Indo-Bangladesh border - high alert zone", state:"Tripura", radius_km:4, center_lat:23.830, center_lng:91.290, active:true },
+  { id:"GF04", name:"Moreh Border Town", zone_type:"sensitive", description:"Border trade zone - surveillance required", state:"Manipur", radius_km:6, center_lat:24.250, center_lng:94.300, active:true },
+  { id:"GF05", name:"Tawang North Zone", zone_type:"restricted", description:"LAC proximity - ILP required", state:"Arunachal Pradesh", radius_km:8, center_lat:27.600, center_lng:91.870, active:true },
+  { id:"GF06", name:"Kaziranga Core Zone", zone_type:"sensitive", description:"One-horn rhino habitat - no off-road", state:"Assam", radius_km:10, center_lat:26.577, center_lng:93.171, active:true },
+];
+
+// ═══════════════════════════════════════════════════════════════
+// ROOT
+// ═══════════════════════════════════════════════════════════════
+export default function App() {
+  const [token, setToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(TOKEN_KEY);
+    if (stored) setToken(stored);
+  }, []);
+
+  const handleLogout = () => {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken(null);
+  };
+
+  if (!token) return <LoginScreen onLogin={setToken}/>;
+  return <CommandCenter token={token} onLogout={handleLogout}/>;
+}

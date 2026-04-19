@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+node_modules/
+build/
+*.pt
+*.onnx
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.apk
+*.aab
+pgdata/
+.pytest_cache/
+*.egg-info/
+.DS_Store
