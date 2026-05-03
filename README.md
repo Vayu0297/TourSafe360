@@ -1,4 +1,4 @@
-# 🛡️ TourSafe360
+#  TourSafe360
 ## AI-Powered Tourism Safety Platform for Northeast India
 
 ### 📱 Apps
